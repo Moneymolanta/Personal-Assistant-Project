@@ -6,146 +6,231 @@ import os
 import asyncio
 import edge_tts
 import pygame
+import cv2
+import threading
+
 
 class DollAI:
     def __init__(self):
-        # Choose your local model here
-        self.model_name = "qwen2.5:3b"
-        
-        # 1. Automate the model check and download
+        # =========================
+        # CAMERA SETUP
+        # =========================
+        self.cap = cv2.VideoCapture(0)
+        self.last_frame = None
+        self.frame_lock = threading.Lock()
+        self.use_camera = True
+
+        # Start camera thread
+        threading.Thread(target=self.camera_loop, daemon=True).start()
+
+        # =========================
+        # MODEL SETUP
+        # =========================
+        self.chat_model = "qwen2.5:3b"
+        self.vision_model = "moondream"
+
         self.ensure_model_exists()
-        
-        # Initialize Speech Recognizer
+
+        # =========================
+        # SPEECH RECOGNITION
+        # =========================
         self.recognizer = sr.Recognizer()
-        
-        # Initialize Audio Player (pygame Mixer is great for playing MP3s cleanly)
+
+        with sr.Microphone() as source:
+            self.recognizer.adjust_for_ambient_noise(source, duration=1)
+
+        # =========================
+        # AUDIO OUTPUT (TTS)
+        # =========================
         pygame.mixer.init()
-        
-        # Configure Edge TTS Voice. "en-US-GuyNeural" or "en-GB-SoniaNeural" sound amazing!
         self.voice_character = "en-US-GuyNeural"
-        
-        # System instructions to give the doll a specific personality
+
+        # =========================
+        # SYSTEM PROMPT
+        # =========================
         self.system_prompt = (
-            "You are an amicale personal assistant who has been working for me for several years. "
-            "Keep your answers brief, engaging, and professional (1-3 sentences maximum) "
-            "as you are talking to a human friend or colleague. "
-            "Do not write out reasoning blocks, use thinking mode, or use markdown text or asterisks."
+            "You are a helpful personal assistant. "
+            "Keep responses short (1-3 sentences), natural, and conversational."
         )
 
+    # =========================================================
+    # MODEL CHECK
+    # =========================================================
     def ensure_model_exists(self):
-        """ Checks if the model is local; downloads it automatically if missing """
-        print(f"[Checking local Ollama inventory for '{self.model_name}'...]")
+        print(f"[Checking models...]")
+
         try:
             local_models = ollama.list()
-            downloaded_names = [m['model'] for m in local_models.get('models', [])]
-            
-            if any(self.model_name in name for name in downloaded_names):
-                print(f"[Brain Module Found: '{self.model_name}' is ready to go!]")
-                return
+            downloaded = [m["model"] for m in local_models.get("models", [])]
 
-            print(f"\n[Model '{self.model_name}' not found locally!]")
-            print(f"[Downloading model files directly from Ollama registry now...]")
-            
-            current_status = ""
-            for progress in ollama.pull(self.model_name, stream=True):
-                status = progress.get('status', '')
-                if status != current_status:
-                    print(f" -> Status: {status}")
-                    current_status = status
-                    
-            print(f"[Download and Initialization of '{self.model_name}' Complete!]\n")
+            for model in [self.chat_model, self.vision_model]:
+                if any(model in m for m in downloaded):
+                    print(f"[OK] {model}")
+                else:
+                    print(f"[Downloading {model}]")
+                    ollama.pull(model)
 
         except Exception as e:
-            print("\n[CRITICAL ERROR: Could not connect to the Ollama application.]")
-            print(" -> Please make sure the Ollama application is running in the background of your laptop!")
-            print(f" -> Error Details: {e}")
+            print("Ollama not running:", e)
             sys.exit(1)
 
+    # =========================================================
+    # CAMERA LOOP (FAST + SAFE)
+    # =========================================================
+    def camera_loop(self):
+        while self.use_camera:
+            ret, frame = self.cap.read()
+            if ret:
+                with self.frame_lock:
+                    self.last_frame = frame
+
+            time.sleep(0.03)  # prevents CPU overload
+
+    def get_latest_frame(self):
+        with self.frame_lock:
+            if self.last_frame is None:
+                return None
+            return self.last_frame.copy()
+
+    # =========================================================
+    # VISION (MOONDREAM)
+    # =========================================================
+    def describe_scene(self, question=None):
+        frame = self.get_latest_frame()
+
+        if frame is None:
+            return "I cannot see anything right now."
+
+        _, buffer = cv2.imencode(".jpg", frame)
+        image_bytes = buffer.tobytes()
+
+        prompt = question if question else "Describe what you see."
+
+        response = ollama.chat(
+            model=self.vision_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                    "images": [image_bytes]
+                }
+            ]
+        )
+
+        return response["message"]["content"]
+
+    # =========================================================
+    # CHAT MODEL (QWEN)
+    # =========================================================
+    def get_llm_response(self, user_text):
+        try:
+            response = ollama.chat(
+                model=self.chat_model,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": user_text}
+                ]
+            )
+            return response["message"]["content"]
+        except Exception as e:
+            return f"LLM error: {e}"
+
+    # =========================================================
+    # ROUTER (FAST - NO LLM NEEDED)
+    # =========================================================
+    def route_request(self, user_text):
+        text = user_text.lower()
+
+        vision_keywords = [
+            "see", "look", "camera", "what is",
+            "what's in", "describe", "image",
+            "picture", "around me"
+        ]
+
+        if any(k in text for k in vision_keywords):
+            print("[VISION MODE]")
+            return self.describe_scene(user_text)
+
+        print("[CHAT MODE]")
+        return self.get_llm_response(user_text)
+
+    # =========================================================
+    # TTS
+    # =========================================================
     def speak(self, text):
-        """ Converts text to MP3 and plays it back smoothly over audio channels """
-        print(f"\nDoll says: '{text}'")
-        
-        # Helper function to generate and play audio asynchronously
-        async def generate_speech():
-            output_filename = "response.mp3"
-            communicate = edge_tts.Communicate(text, self.voice_character)
-            await communicate.save(output_filename)
-            
-            # Play the generated audio file
-            pygame.mixer.music.load(output_filename)
+        print(f"\nDoll: {text}")
+
+        async def run_tts():
+            file = "response.mp3"
+
+            tts = edge_tts.Communicate(text, self.voice_character)
+            await tts.save(file)
+
+            pygame.mixer.music.load(file)
             pygame.mixer.music.play()
-            
-            # Block the script until the voice finishes speaking completely
+
             while pygame.mixer.music.get_busy():
                 await asyncio.sleep(0.1)
-                
-            # Unload audio file so Windows/Mac releases the file lock
+
             pygame.mixer.music.unload()
+
             try:
-                os.remove(output_filename)
-            except Exception:
+                os.remove(file)
+            except:
                 pass
 
-        # Execute the async speech generator cleanly within our standard synchronous loop
-        asyncio.run(generate_speech())
+        asyncio.run(run_tts())
 
+    # =========================================================
+    # LISTEN
+    # =========================================================
     def listen(self):
-        """ Listens to the microphone and converts it to text """
         with sr.Microphone() as source:
-            print("\n[Listening... Speak into your microphone]")
-            self.recognizer.adjust_for_ambient_noise(source, duration=1)
-            
+            print("\nListening...")
             try:
-                audio_data = self.recognizer.listen(source, timeout=25, phrase_time_limit=25)
-                text_input = self.recognizer.recognize_google(audio_data)
-                print(f"You said: '{text_input}'")
-                return text_input
-                
-            except (sr.WaitTimeoutError, sr.UnknownValueError):
-                return None
-            except sr.RequestError:
-                print("[System Error: Check internet/network proxy connection]")
+                audio = self.recognizer.listen(source, timeout=25, phrase_time_limit=25)
+                text = self.recognizer.recognize_google(audio)
+                print(f"You: {text}")
+                return text
+            except:
                 return None
 
-    def get_llm_response(self, user_text):
-        """ Sends user text to the local Ollama LLM and returns the character response """
-        print(f"[Thinking using {self.model_name}...]")
-        try:
-            response = ollama.chat(model=self.model_name, messages=[
-                {'role': 'system', 'content': self.system_prompt},
-                {'role': 'user', 'content': user_text}
-            ])
-            return response['message']['content']
-        except Exception as e:
-            return f"Brain module error. Could not reach Ollama. Error details: {e}"
-
+    # =========================================================
+    # MAIN LOOP
+    # =========================================================
     def run_loop(self):
-        self.speak("System initialized. I am ready to talk!")
-        
+        self.speak("System ready.")
+
         while True:
-            user_speech = self.listen()
-            
-            if user_speech and user_speech.strip():
-                clean_speech = user_speech.strip()
+            user = self.listen()
 
-                if "goodbye" in clean_speech.lower() or "quit" in clean_speech.lower():
-                    self.speak("Goodbye for now, friend!")
-                    break
-                
-                # 1. Save what you said to your diary log file
-                with open("diary_log.txt", "a", encoding="utf-8") as file:
-                    file.write(f"User: {clean_speech}\n")
-                
-                # 2. Think using the LLM
-                ai_response = self.get_llm_response(clean_speech)
-                
-                # 3. Save what the AI said to the log file
-                with open("diary_log.txt", "a", encoding="utf-8") as file:
-                    file.write(f"Doll: {ai_response}\n\n")
-                
-                # 4. Speak the response aloud
-                self.speak(ai_response)
+            if not user:
+                continue
 
+            user = user.strip()
+
+            if "quit" in user.lower() or "goodbye" in user.lower():
+                self.speak("Goodbye.")
+                break
+
+            response = self.route_request(user)
+            self.speak(response)
+
+    # =========================================================
+    # CLEANUP
+    # =========================================================
+    def cleanup(self):
+        self.use_camera = False
+        if self.cap:
+            self.cap.release()
+
+
+# =========================================================
+# RUN
+# =========================================================
 if __name__ == "__main__":
-    doll = DollAI()
-    doll.run_loop()
+    bot = DollAI()
+    try:
+        bot.run_loop()
+    finally:
+        bot.cleanup()
